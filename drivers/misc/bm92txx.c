@@ -358,6 +358,50 @@
 #define PD_INPUT_CURRENT_LIMIT_MIN_MA   0u
 #define PD_INPUT_CURRENT_LIMIT_MAX_MA   3000u
 #define PD_INPUT_VOLTAGE_LIMIT_MAX_MV   17000u
+#include <linux/moduleparam.h>
+
+#define MAX_CURRENT_LIMIT_MA 3072u
+
+/* Default variables */
+static u32 pd_05v_limit_ma = 2000;
+static u32 pd_09v_limit_ma = 2000;
+static u32 pd_12v_limit_ma = 1500;
+static u32 pd_15v_limit_ma = 1200;
+
+/* Custom setter callback to cap inputs at 3072 mA */
+static int param_set_capped_u32(const char *val, const struct kernel_param *kp)
+{
+    u32 temp;
+    int ret = kstrtouint(val, 0, &temp);
+    if (ret)
+        return ret;
+
+    if (temp > MAX_CURRENT_LIMIT_MA)
+        *(u32 *)kp->arg = MAX_CURRENT_LIMIT_MA;
+    else
+        *(u32 *)kp->arg = temp;
+
+    return 0;
+}
+
+/* Custom param ops combining custom setter with standard u32 getter */
+static const struct kernel_param_ops capped_u32_ops = {
+    .set = param_set_capped_u32,
+    .get = param_get_uint,
+};
+
+/* Module parameters exposed to sysfs with 0600 (root read/write) permissions */
+module_param_cb(pd_05v_limit_ma, &capped_u32_ops, &pd_05v_limit_ma, 0600);
+MODULE_PARM_DESC(pd_05v_limit_ma, "Max 05V charging current limit (mA, capped at 3072)");
+
+module_param_cb(pd_09v_limit_ma, &capped_u32_ops, &pd_09v_limit_ma, 0600);
+MODULE_PARM_DESC(pd_09v_limit_ma, "Max 09V charging current limit (mA, capped at 3072)");
+
+module_param_cb(pd_12v_limit_ma, &capped_u32_ops, &pd_12v_limit_ma, 0600);
+MODULE_PARM_DESC(pd_12v_limit_ma, "Max 12V charging current limit (mA, capped at 3072)");
+
+module_param_cb(pd_15v_limit_ma, &capped_u32_ops, &pd_15v_limit_ma, 0600);
+MODULE_PARM_DESC(pd_15v_limit_ma, "Max 15V charging current limit (mA, capped at 3072)");
 
 /* All states with ND are for Nintendo Dock */
 enum bm92t_state_type {

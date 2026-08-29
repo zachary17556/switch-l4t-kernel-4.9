@@ -71,6 +71,12 @@
 
 #define BQ2419X_NORMAL_OPERATING_TEMP	55000
 
+/* Custom 900 mA charging protection */
+#define BQ2419X_SAFE_CHARGE_CURRENT_MA	900
+#define BQ2419X_FALLBACK_CHARGE_CURRENT_MA	500
+
+#define BQ2419X_THERMAL_LIMIT_MC	55000
+#define BQ2419X_THERMAL_RETRY_MC	50000
 /* input current limit */
 static const unsigned int iinlim[] = {
 	100, 150, 500, 900, 1200, 1500, 2000, 3000,
@@ -131,6 +137,10 @@ struct bq2419x_chip {
 	int				battery_presense;
 	bool				cable_connected;
 	int				last_charging_current;
+	/* Custom charge-current protection */
+	int				requested_charge_current;
+	bool				charge_900ma_active;
+	bool				charge_900ma_fault;
 	bool				disable_suspend_during_charging;
 	bool				wake_lock_released;
 	int				last_temp;
@@ -1370,43 +1380,509 @@ scrub:
 #include <linux/seq_file.h>
 
 static struct dentry *debugfs_root;
+
+/*
+ * Show the complete BQ2419x charger state.
+ */
+static int bq2419x_debugfs_status_show(struct seq_file *s, void *data)
+{
+	struct bq2419x_chip *bq2419x = s->private;
+
+	unsigned int r00, r01, r02, r03, r04;
+	unsigned int r05, r06, r07, r08, r09, r0a;
+	unsigned int code;
+	int ret;
+
+	/* Read all BQ2419x registers. */
+
+	ret = regmap_read(bq2419x->regmap,
+			  BQ2419X_INPUT_SRC_REG, &r00);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_read(bq2419x->regmap,
+			  BQ2419X_PWR_ON_REG, &r01);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_read(bq2419x->regmap,
+			  BQ2419X_CHRG_CTRL_REG, &r02);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_read(bq2419x->regmap,
+			  BQ2419X_CHRG_TERM_REG, &r03);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_read(bq2419x->regmap,
+			  BQ2419X_VOLT_CTRL_REG, &r04);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_read(bq2419x->regmap,
+			  BQ2419X_TIME_CTRL_REG, &r05);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_read(bq2419x->regmap,
+			  BQ2419X_THERM_REG, &r06);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_read(bq2419x->regmap,
+			  BQ2419X_MISC_OPER_REG, &r07);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_read(bq2419x->regmap,
+			  BQ2419X_SYS_STAT_REG, &r08);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_read(bq2419x->regmap,
+			  BQ2419X_FAULT_REG, &r09);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_read(bq2419x->regmap,
+			  BQ2419X_REVISION_REG, &r0a);
+	if (ret < 0)
+		return ret;
+
+
+	seq_puts(s,
+		"========================================\n"
+		"          BQ24193 CHARGER STATUS\n"
+		"========================================\n\n");
+
+
+	/* ========================================================= */
+	/* REG00 - INPUT SOURCE                                      */
+	/* ========================================================= */
+
+	seq_printf(s, "REG00 INPUT SOURCE:  0x%02X\n", r00);
+
+	seq_printf(s, "  HIZ:                %s\n",
+		   (r00 & BIT(7)) ? "ON" : "OFF");
+
+	code = (r00 >> 3) & 0x0f;
+
+	seq_printf(s, "  VINDPM code:        %u\n", code);
+
+	/*
+	 * BQ24193 VINDPM:
+	 * 3880mV + 80mV per code
+	 */
+	seq_printf(s, "  VINDPM:             %u mV\n",
+		   3880 + (code * 80));
+
+	code = r00 & BQ2419x_INPUT_CURRENT_MASK;
+
+	switch (code) {
+	case 0:
+		seq_puts(s, "  Input current:      100 mA\n");
+		break;
+	case 1:
+		seq_puts(s, "  Input current:      150 mA\n");
+		break;
+	case 2:
+		seq_puts(s, "  Input current:      500 mA\n");
+		break;
+	case 3:
+		seq_puts(s, "  Input current:      900 mA\n");
+		break;
+	case 4:
+		seq_puts(s, "  Input current:      1200 mA\n");
+		break;
+	case 5:
+		seq_puts(s, "  Input current:      1500 mA\n");
+		break;
+	case 6:
+		seq_puts(s, "  Input current:      2000 mA\n");
+		break;
+	case 7:
+		seq_puts(s, "  Input current:      3000 mA\n");
+		break;
+	default:
+		seq_puts(s, "  Input current:      UNKNOWN\n");
+		break;
+	}
+
+
+	/* ========================================================= */
+	/* REG01 - POWER ON                                         */
+	/* ========================================================= */
+
+	seq_printf(s, "\nREG01 POWER:         0x%02X\n", r01);
+
+	code = (r01 >> 4) & 0x03;
+
+	switch (code) {
+	case 0:
+		seq_puts(s, "  Charge config:      DISABLED\n");
+		break;
+	case 1:
+		seq_puts(s, "  Charge config:      CHARGE ONLY\n");
+		break;
+	case 2:
+		seq_puts(s, "  Charge config:      VBUS\n");
+		break;
+	case 3:
+		seq_puts(s, "  Charge config:      VBUS + CHARGE\n");
+		break;
+	}
+
+	seq_printf(s, "  SYS_MIN:            %u mV\n",
+		   3000 + (((r01 >> 1) & 0x07) * 100));
+
+	seq_printf(s, "  BOOST current:      %s\n",
+		   (r01 & BIT(0)) ? "1300 mA" : "500 mA");
+
+
+	/* ========================================================= */
+	/* REG02 - CHARGE CURRENT                                    */
+	/* ========================================================= */
+
+	seq_printf(s, "\nREG02 CHARGE CURRENT: 0x%02X\n", r02);
+
+	code = (r02 >> 2) & 0x3f;
+
+	seq_printf(s, "  ICHG code:          %u\n", code);
+
+	seq_printf(s, "  Charge current:     %u mA\n",
+		   512 + (code * 64));
+
+	seq_printf(s, "  20%% current mode:   %s\n",
+		   (r02 & BIT(0)) ? "YES" : "NO");
+
+
+	/* ========================================================= */
+	/* REG03 - PRECHARGE / TERMINATION                           */
+	/* ========================================================= */
+
+	seq_printf(s, "\nREG03 PRECHARGE:     0x%02X\n", r03);
+
+	seq_printf(s, "  Precharge current:  %u mA\n",
+		   128 + (((r03 >> 4) & 0x0f) * 128));
+
+	seq_printf(s, "  Termination current:%u mA\n",
+		   128 + ((r03 & 0x0f) * 128));
+
+
+	/* ========================================================= */
+	/* REG04 - CHARGE VOLTAGE                                    */
+	/* ========================================================= */
+
+	seq_printf(s, "\nREG04 VOLTAGE:       0x%02X\n", r04);
+
+	seq_printf(s, "  Charge voltage:     %u mV\n",
+		   3504 + (((r04 >> 2) & 0x3f) * 16));
+
+	seq_printf(s, "  BATLOWV:            %s\n",
+		   (r04 & BIT(1)) ? "3.0 V" : "2.8 V");
+
+	seq_printf(s, "  Recharge threshold: %s\n",
+		   (r04 & BIT(0)) ? "300 mV" : "100 mV");
+
+
+	/* ========================================================= */
+	/* REG05 - CHARGE TIMER                                     */
+	/* ========================================================= */
+
+	seq_printf(s, "\nREG05 TIMER:         0x%02X\n", r05);
+
+	seq_printf(s, "  Termination:         %s\n",
+		   (r05 & BIT(7)) ? "ENABLED" : "DISABLED");
+
+	code = (r05 >> 4) & 0x03;
+
+	switch (code) {
+	case 0:
+		seq_puts(s, "  Watchdog:            DISABLED\n");
+		break;
+	case 1:
+		seq_puts(s, "  Watchdog:            40 ms\n");
+		break;
+	case 2:
+		seq_puts(s, "  Watchdog:            80 ms\n");
+		break;
+	case 3:
+		seq_puts(s, "  Watchdog:            160 ms\n");
+		break;
+	}
+
+	seq_printf(s, "  Safety timer:        %s\n",
+		   (r05 & BIT(3)) ? "ENABLED" : "DISABLED");
+
+
+	/* ========================================================= */
+	/* REG06 - THERMAL                                          */
+	/* ========================================================= */
+
+	seq_printf(s, "\nREG06 THERMAL:       0x%02X\n", r06);
+
+	seq_printf(s, "  BAT_COMP code:       %u\n",
+		   (r06 >> 5) & 0x07);
+
+	seq_printf(s, "  BAT_COMP:            %u mOhm\n",
+		   ((r06 >> 5) & 0x07) * 10);
+
+	seq_printf(s, "  VCLAMP code:         %u\n",
+		   (r06 >> 2) & 0x07);
+
+	seq_printf(s, "  VCLAMP:              %u mV\n",
+		   ((r06 >> 2) & 0x07) * 16);
+
+	seq_printf(s, "  Thermal regulation:  %u C\n",
+		   60 + ((r06 & 0x03) * 20));
+
+
+	/* ========================================================= */
+	/* REG07 - MISC                                             */
+	/* ========================================================= */
+
+	seq_printf(s, "\nREG07 MISC:          0x%02X\n", r07);
+
+	seq_printf(s, "  BATFET:              %s\n",
+		   (r07 & BIT(5)) ? "OFF" : "ON");
+
+
+	/* ========================================================= */
+	/* REG08 - SYSTEM STATUS                                    */
+	/* ========================================================= */
+
+	seq_printf(s, "\nREG08 STATUS:        0x%02X\n", r08);
+
+	code = (r08 >> 6) & 0x03;
+
+	switch (code) {
+	case 0:
+		seq_puts(s, "  VBUS:                UNKNOWN\n");
+		break;
+	case 1:
+		seq_puts(s, "  VBUS:                USB HOST\n");
+		break;
+	case 2:
+		seq_puts(s, "  VBUS:                ADAPTER\n");
+		break;
+	case 3:
+		seq_puts(s, "  VBUS:                OTG\n");
+		break;
+	}
+
+	code = (r08 >> 4) & 0x03;
+
+	switch (code) {
+	case 0:
+		seq_puts(s, "  Charging:            NOT CHARGING\n");
+		break;
+	case 1:
+		seq_puts(s, "  Charging:            PRE-CHARGE\n");
+		break;
+	case 2:
+		seq_puts(s, "  Charging:            FAST CHARGE\n");
+		break;
+	case 3:
+		seq_puts(s, "  Charging:            COMPLETE\n");
+		break;
+	}
+
+	seq_printf(s, "  DPM active:          %s\n",
+		   (r08 & BIT(3)) ? "YES" : "NO");
+
+	seq_printf(s, "  Power good:          %s\n",
+		   (r08 & BIT(2)) ? "YES" : "NO");
+
+	seq_printf(s, "  Thermal regulation:  %s\n",
+		   (r08 & BIT(1)) ? "ACTIVE" : "NORMAL");
+
+	seq_printf(s, "  VSYS regulation:     %s\n",
+		   (r08 & BIT(0)) ? "ACTIVE" : "NORMAL");
+
+
+	/* ========================================================= */
+	/* REG09 - FAULT                                            */
+	/* ========================================================= */
+
+	seq_printf(s, "\nREG09 FAULT:         0x%02X\n", r09);
+
+	seq_printf(s, "  Watchdog fault:      %s\n",
+		   (r09 & BIT(7)) ? "YES" : "NO");
+
+	seq_printf(s, "  Boost fault:         %s\n",
+		   (r09 & BIT(6)) ? "YES" : "NO");
+
+	code = (r09 >> 4) & 0x03;
+
+	switch (code) {
+	case 0:
+		seq_puts(s, "  Charge fault:        NORMAL\n");
+		break;
+	case 1:
+		seq_puts(s, "  Charge fault:        INPUT\n");
+		break;
+	case 2:
+		seq_puts(s, "  Charge fault:        THERMAL\n");
+		break;
+	case 3:
+		seq_puts(s, "  Charge fault:        SAFETY TIMER\n");
+		break;
+	}
+
+	seq_printf(s, "  Battery fault:       %s\n",
+		   (r09 & BIT(3)) ? "YES" : "NO");
+
+	code = r09 & 0x07;
+
+	switch (code) {
+	case 0:
+		seq_puts(s, "  NTC status:          NORMAL\n");
+		break;
+	case 1:
+		seq_puts(s, "  NTC status:          COLD\n");
+		break;
+	case 2:
+		seq_puts(s, "  NTC status:          HOT\n");
+		break;
+	case 3:
+		seq_puts(s, "  NTC status:          COLD\n");
+		break;
+	case 4:
+		seq_puts(s, "  NTC status:          HOT\n");
+		break;
+	default:
+		seq_printf(s, "  NTC status:          CODE %u\n", code);
+		break;
+	}
+
+
+	/* ========================================================= */
+	/* REG0A - REVISION                                         */
+	/* ========================================================= */
+
+	seq_printf(s, "\nREG0A REVISION:      0x%02X\n", r0a);
+
+	seq_printf(s, "  IC version:          0x%02X\n",
+		   r0a & BQ2419X_IC_VER_MASK);
+
+	if ((r0a & BQ2419X_IC_VER_MASK) == BQ24190_IC_VER)
+		seq_puts(s, "  IC:                  BQ24190\n");
+	else if ((r0a & BQ2419X_IC_VER_MASK) == BQ24192_IC_VER)
+		seq_puts(s, "  IC:                  BQ24192/BQ24193\n");
+	else if ((r0a & BQ2419X_IC_VER_MASK) == BQ24192i_IC_VER)
+		seq_puts(s, "  IC:                  BQ24192i\n");
+	else
+		seq_puts(s, "  IC:                  UNKNOWN\n");
+
+
+	/* ========================================================= */
+	/* DRIVER STATE                                              */
+	/* ========================================================= */
+
+	seq_puts(s,
+		"\n----------------------------------------\n"
+		"DRIVER STATE\n"
+		"----------------------------------------\n");
+
+	seq_printf(s, "  Cable connected:     %s\n",
+		   bq2419x->cable_connected ? "YES" : "NO");
+
+	seq_printf(s, "  Battery present:     %s\n",
+		   bq2419x->battery_presense ? "YES" : "NO");
+
+	seq_printf(s, "  OTG connected:       %s\n",
+		   bq2419x->is_otg_connected ? "YES" : "NO");
+
+	seq_printf(s, "  Input current limit: %d mA\n",
+		   bq2419x->in_current_limit);
+
+	seq_printf(s, "  Last charge current: %d mA\n",
+		   bq2419x->last_charging_current / 1000);
+
+	seq_printf(s, "  Last temperature:    %d.%03d C\n",
+		   bq2419x->last_temp / 1000,
+		   abs(bq2419x->last_temp % 1000));
+
+	seq_printf(s, "  Wake lock released:  %s\n",
+		   bq2419x->wake_lock_released ? "YES" : "NO");
+
+	seq_printf(s, "  Thermal disabled:    %s\n",
+		   bq2419x->thermal_chg_disable ? "YES" : "NO");
+
+	seq_puts(s, "\n");
+
+	return 0;
+}
+
+
+static int bq2419x_debugfs_status_open(struct inode *inode,
+					struct file *file)
+{
+	return single_open(file,
+			   bq2419x_debugfs_status_show,
+			   inode->i_private);
+}
+
+
+static const struct file_operations bq2419x_debugfs_status_fops = {
+	.owner		= THIS_MODULE,
+	.open		= bq2419x_debugfs_status_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+
 static ssize_t bq2419x_show_suspend_state(struct file *file,
-			char __user *user_buf, size_t count, loff_t *ppos)
+					   char __user *user_buf,
+					   size_t count,
+					   loff_t *ppos)
 {
 	struct i2c_client *client = file->private_data;
-	struct bq2419x_chip *bq2419x = i2c_get_clientdata(client);
+	struct bq2419x_chip *bq2419x =
+		i2c_get_clientdata(client);
 	char buf[64] = { 0, };
 	ssize_t ret = 0;
 
 	if (bq2419x->wake_lock_released ||
-			(bq2419x->chg_status == BATTERY_CHARGING_DONE) ||
-			(bq2419x->in_current_limit <= 500))
-		ret = snprintf(buf, sizeof(buf), "Wake lock disabled\n");
+	    (bq2419x->chg_status == BATTERY_CHARGING_DONE) ||
+	    (bq2419x->in_current_limit <= 500))
+		ret = snprintf(buf, sizeof(buf),
+			       "Wake lock disabled\n");
 	else if (!bq2419x->wake_lock_released ||
-			(bq2419x->in_current_limit > 500))
-		ret = snprintf(buf, sizeof(buf), "Wake lock enabled\n");
+		 (bq2419x->in_current_limit > 500))
+		ret = snprintf(buf, sizeof(buf),
+			       "Wake lock enabled\n");
 
-	return simple_read_from_buffer(user_buf, count, ppos, buf, ret);
+	return simple_read_from_buffer(user_buf, count, ppos,
+				       buf, ret);
 }
 
-static ssize_t bq2419x_enable_suspend_on_charging(struct file *file,
-			const char __user *user_buf, size_t count, loff_t *ppos)
+
+static ssize_t bq2419x_enable_suspend_on_charging(
+					struct file *file,
+					const char __user *user_buf,
+					size_t count,
+					loff_t *ppos)
 {
 	struct i2c_client *client = file->private_data;
-	struct bq2419x_chip *bq2419x = i2c_get_clientdata(client);
+	struct bq2419x_chip *bq2419x =
+		i2c_get_clientdata(client);
 	char buf[64] = { 0, };
 	ssize_t buf_size;
 	bool enabled;
 	int ret;
 
 	if (!bq2419x->cable_connected ||
-			(bq2419x->chg_status == BATTERY_CHARGING_DONE))
+	    (bq2419x->chg_status == BATTERY_CHARGING_DONE))
 		return -EINVAL;
 
 	if (!bq2419x->disable_suspend_during_charging)
 		return -EINVAL;
 
-	buf_size = min(count, (sizeof(buf)-1));
+	buf_size = min(count, (sizeof(buf) - 1));
+
 	if (copy_from_user(buf, user_buf, buf_size))
 		return -EFAULT;
 
@@ -1418,52 +1894,106 @@ static ssize_t bq2419x_enable_suspend_on_charging(struct file *file,
 		return -EINVAL;
 
 	if (enabled && !bq2419x->wake_lock_released) {
+
 		if (bq2419x->in_current_limit == 500)
 			return -EINVAL;
-		ret = bq2419x_configure_input_charging_current(bq2419x, 500);
-		if (ret  < 0) {
+
+		ret = bq2419x_configure_input_charging_current(
+			bq2419x, 500);
+
+		if (ret < 0) {
 			dev_err(bq2419x->dev,
-				"Charging Current config faild: %d\n", ret);
+				"Charging Current config failed: %d\n",
+				ret);
 			return ret;
 		}
-		battery_charger_release_wake_lock(bq2419x->bc_dev);
+
+		battery_charger_release_wake_lock(
+			bq2419x->bc_dev);
+
 		bq2419x->wake_lock_released = true;
+
 	} else if (!enabled && bq2419x->wake_lock_released) {
+
 		bq2419x->wake_lock_released = false;
-		ret = bq2419x_configure_input_charging_current(bq2419x,
-				bq2419x->last_charging_current/1000);
-		if (ret  < 0) {
+
+		ret = bq2419x_configure_input_charging_current(
+			bq2419x,
+			bq2419x->last_charging_current / 1000);
+
+		if (ret < 0) {
 			dev_err(bq2419x->dev,
-				"Charging Current config faild: %d\n", ret);
+				"Charging Current config failed: %d\n",
+				ret);
 			return ret;
 		}
-		battery_charger_acquire_wake_lock(bq2419x->bc_dev);
+
+		battery_charger_acquire_wake_lock(
+			bq2419x->bc_dev);
 	}
+
 	return count;
 }
 
+
 static const struct file_operations bq2419x_debug_fops = {
+	.owner		= THIS_MODULE,
 	.open		= simple_open,
 	.write		= bq2419x_enable_suspend_on_charging,
 	.read		= bq2419x_show_suspend_state,
 };
 
-static int bq2419x_debugfs_init(struct i2c_client *client)
-{
-	debugfs_root = debugfs_create_dir("battery_charger", NULL);
-	if (!debugfs_root)
-		pr_warn("bq2419x: Failed to create debugfs directory\n");
 
-	debugfs_create_file("allow_suspend_on_charging", S_IRUGO | S_IWUSR,
-			debugfs_root, (void *)client, &bq2419x_debug_fops);
-	return 0;
+static int bq2419x_debugfs_init(struct i2c_client *client)
+{
+        struct bq2419x_chip *bq2419x;
+
+        bq2419x = i2c_get_clientdata(client);
+        if (!bq2419x) {
+                pr_err("bq2419x: failed to get chip data\n");
+                return -ENODEV;
+        }
+
+        debugfs_root = debugfs_create_dir("battery_charger", NULL);
+
+        if (!debugfs_root) {
+                pr_warn("bq2419x: Failed to create debugfs directory\n");
+                return -ENOMEM;
+        }
+
+        /*
+         * Existing suspend-control debugfs file.
+         * This function expects an i2c_client *.
+         */
+        debugfs_create_file("allow_suspend_on_charging",
+                            S_IRUGO | S_IWUSR,
+                            debugfs_root,
+                            (void *)client,
+                            &bq2419x_debug_fops);
+
+        /*
+         * Status debugfs file.
+         * bq2419x_debugfs_status_show() expects
+         * struct bq2419x_chip * in s->private.
+         */
+        debugfs_create_file("status",
+                            S_IRUGO,
+                            debugfs_root,
+                            (void *)bq2419x,
+                            &bq2419x_debugfs_status_fops);
+
+        return 0;
 }
-#else
+
+#else /* CONFIG_DEBUG_FS */
+
 static int bq2419x_debugfs_init(struct i2c_client *client)
 {
 	return 0;
 }
-#endif
+
+#endif /* CONFIG_DEBUG_FS */
+
 
 static int bq2419x_show_chip_version(struct bq2419x_chip *bq2419x)
 {
